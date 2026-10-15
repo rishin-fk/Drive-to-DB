@@ -1,0 +1,165 @@
+import csv, os, re, shutil, sqlite3, time
+from google.colab import drive
+
+DRIVE_DIR = '/content/drive/MyDrive/REPLACE_WITH_CSV_FOLDER_PATH'
+DRIVE_DB = '/content/drive/MyDrive/REPLACE_WITH_DB_FOLDER/index.db'
+LOCAL_DB = '/content/index.db'
+QUOTE_AWARE = True
+
+PICKER_I, PICKER_R, U_COL = 8, 17, 20
+
+SCHEMA = '''
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS files (name TEXT PRIMARY KEY, mtime REAL, rows INTEGER);
+CREATE TABLE IF NOT EXISTS scans (
+    source_file TEXT, file_mtime REAL, seq INTEGER,
+    box_key TEXT, fsn_key TEXT, sb_key TEXT,
+    bin TEXT, time TEXT, picker_i TEXT, picker_r TEXT, u TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_src ON scans(source_file);
+CREATE INDEX IF NOT EXISTS ix_box ON scans(box_key, fsn_key, file_mtime, seq);
+CREATE INDEX IF NOT EXISTS ix_sb ON scans(sb_key, fsn_key, file_mtime, seq);
+'''
+INSERT = 'INSERT INTO scans VALUES (?,?,?,?,?,?,?,?,?,?,?)'
+
+
+def clean(v):
+    return re.sub(r'^["\']|["\']$', '', str(v or '')).strip()
+
+
+def get(row, i):
+    return clean(row[i]) if 0 <= i < len(row) else ''
+
+
+def iter_rows(path):
+    with open(path, encoding='utf-8-sig', newline='') as f:
+        if QUOTE_AWARE:
+            for row in csv.reader(f):
+                if row:
+                    yield row
+        else:
+            for line in f:
+                if line.strip():
+                    yield line.rstrip('\r\n').split(',')
+
+
+def detect_headers(cols):
+    fsn = box = sb = bn = tm = -1
+    for i, c in enumerate(cols):
+        if c in ('prod_fsn', 'fsn'): fsn = i
+        if c == 'sorted_box': sb = i
+        if c in ('box_id', 'box', 'box_code'): box = i
+        if c in ('bin_id', 'bin', 'location'): bn = i
+        if c in ('item_picked_time', 'picked_time', 'pick_time', 'picked_at'): tm = i
+    for i, c in enumerate(cols):
+        if fsn == -1 and 'fsn' in c: fsn = i
+        if sb == -1 and 'sorted_box' in c: sb = i
+        if box == -1 and 'sorted' not in c and ('box' in c or 'tote' in c): box = i
+        if bn == -1 and ('bin' in c or 'location' in c): bn = i
+        if tm == -1 and ('time' in c or 'timestamp' in c or 'date' in c) \
+                and not any(x in c for x in ('box', 'bin', 'id', 'user')):
+            tm = i
+    if box == -1 and sb != -1:
+        box = sb
+    return fsn, box, sb, bn, tm
+
+
+def walk_csv(root):
+    for d, _, names in os.walk(root):
+        for n in names:
+            if n.lower().endswith('.csv'):
+                yield os.path.join(d, n)
+
+
+def load_file(con, path, rel, mtime, layout):
+    fsn_i, box_i, sb_i, bn_i, tm_i = layout
+    maxc = max(layout)
+    con.execute('DELETE FROM scans WHERE source_file=?', (rel,))
+    rows = iter_rows(path)
+    next(rows, None)
+    batch, seq = [], 0
+    for cols in rows:
+        seq += 1
+        if len(cols) <= maxc:
+            continue
+        fsn = get(cols, fsn_i)
+        if not fsn:
+            continue
+        batch.append((rel, mtime, seq,
+                      get(cols, box_i).upper(), fsn.upper(), get(cols, sb_i).upper(),
+                      get(cols, bn_i), get(cols, tm_i),
+                      get(cols, PICKER_I), get(cols, PICKER_R), get(cols, U_COL)))
+        if len(batch) >= 50_000:
+            con.executemany(INSERT, batch)
+            batch.clear()
+    if batch:
+        con.executemany(INSERT, batch)
+    con.execute('INSERT OR REPLACE INTO files VALUES (?,?,?)', (rel, mtime, seq))
+    con.commit()
+
+
+def build():
+    t0 = time.time()
+    if os.path.exists(DRIVE_DB) and not os.path.exists(LOCAL_DB):
+        shutil.copy(DRIVE_DB, LOCAL_DB)
+    con = sqlite3.connect(LOCAL_DB)
+    con.executescript(SCHEMA)
+
+    parse_mode = 'quote_aware' if QUOTE_AWARE else 'naive'
+    stored = con.execute("SELECT value FROM meta WHERE key='parse_mode'").fetchone()
+    if stored and stored[0] != parse_mode:
+        con.execute('DELETE FROM scans')
+        con.execute('DELETE FROM files')
+        print('Parse mode changed, rebuilding every file')
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('parse_mode', ?)", (parse_mode,))
+    con.commit()
+
+    files = sorted(walk_csv(DRIVE_DIR), key=os.path.getmtime)
+    if not files:
+        raise SystemExit('No CSV files found in DRIVE_DIR')
+    ref_header = None
+    for p in files:
+        h = next(iter_rows(p), None)
+        if h:
+            ref_header = [clean(c).lower() for c in h]
+            break
+    layout = detect_headers(ref_header)
+    if layout[0] == -1 or layout[1] == -1:
+        raise SystemExit(f'Header lacks fsn/box columns: {ref_header}')
+    print('Layout (fsn, box, sorted_box, bin, time):', layout)
+
+    present, loaded, unchanged, excluded = set(), 0, 0, 0
+    for p in files:
+        rel = os.path.relpath(p, DRIVE_DIR)
+        h = next(iter_rows(p), None)
+        if not h or [clean(c).lower() for c in h] != ref_header:
+            print('Header mismatch, excluded:', rel)
+            excluded += 1
+            continue
+        present.add(rel)
+        mtime = os.path.getmtime(p)
+        row = con.execute('SELECT mtime FROM files WHERE name=?', (rel,)).fetchone()
+        if row and row[0] == mtime:
+            unchanged += 1
+            continue
+        load_file(con, p, rel, mtime, layout)
+        loaded += 1
+        print('loaded:', rel)
+
+    for (name,) in con.execute('SELECT name FROM files').fetchall():
+        if name not in present:
+            con.execute('DELETE FROM scans WHERE source_file=?', (name,))
+            con.execute('DELETE FROM files WHERE name=?', (name,))
+    con.commit()
+    con.close()
+
+    t1 = time.time()
+    shutil.copy(LOCAL_DB, DRIVE_DB)
+    print(f'Loaded {loaded}, unchanged {unchanged}, excluded {excluded}')
+    print(f'Database: {os.path.getsize(LOCAL_DB) / 1e6:.1f} MB')
+    print(f'Build {t1 - t0:.1f}s, copy to Drive {time.time() - t1:.1f}s')
+
+
+if __name__ == '__main__':
+    drive.mount('/content/drive')
+    build()
