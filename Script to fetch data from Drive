@@ -1,0 +1,651 @@
+/**
+ * LOCATION / TIME / PICKER ID / AB / AC / AH MAPPER (HEADER-FIXED EDITION)
+ * ------------------------------------------------------------------
+ * - Dynamically binds to the ACTIVE Google Sheet running the script.
+ * - Fixes Time column matching to prevent Box IDs in Column AA.
+ * - Processes 400MB+ CSV files via 15MB rolling memory streams.
+ * - Implements Primary (box) + Fallback (sorted_box) lookup passes.
+ * - Picker ID: fixed-position source columns I (idx 8) and R (idx 17).
+ *   R takes priority over I; falls back to I only if R is empty.
+ *   Written to destination column AG.
+ * - Fixed-position source column U (idx 20) -> destination column AB.
+ *   Same primary/fallback keying as everything else.
+ * - Destination column AC records which Picker ID source won:
+ *   'P&S' if column R had a value (R won), 'PBD' if it fell back to
+ *   column I. Written wherever Picker ID itself is written.
+ * - NEW: destination column AH records the picker's NAME, looked up
+ *   from the 'PICKER DATA' tab (Col A = numeric ID, Col B = FIRST NAME)
+ *   in this same spreadsheet. Match is done by stripping any 'ca.'/'CA.'
+ *   prefix (and any non-digit chars) off the Picker ID (AG) and off the
+ *   PICKER DATA ID column, then comparing the digits. Written wherever
+ *   Picker ID itself is written (i.e. in both executeMapping and
+ *   executePickerMapping) -- same rule AC already follows.
+ * - No date cutoff on source files any more: every file in the Drive folder
+ *   is a scan candidate on every run (old box IDs can live in old files).
+ *   To keep this fast without a date guess, scanning stops early once every
+ *   needed box+fsn key already has a primary match (see scanSourceFiles).
+ * - The 10-day tab-selection window in runDaily (which day-tabs get
+ *   refreshed) is UNCHANGED -- that's a different concern from file scanning.
+ * - BACKFILL_START is now AUTO-DETECTED from the earliest date-named tab
+ *   present in this spreadsheet (see getEarliestTabStart). The
+ *   CONFIG.BACKFILL_START constant is only a fallback, used if no
+ *   date-named tabs exist yet.
+ * - executeMapping()      -> writes Location + Time + Picker ID + AB + AC + AH (combined)
+ * - executePickerMapping()-> writes Picker ID + AC + AH ONLY, standalone/independent
+ * ------------------------------------------------------------------
+ */
+
+const CONFIG = {
+  MASTER_SHEET_ID: '1QLE1ZHO9cfmHj4h8b8QQUUNUSeN4VFeQSFnrMqkjMnY',
+  DRIVE_FOLDER_ID: '1ZODejxkhlRJk9OqyzgXRzezGAHLC57ZI',
+  LOOKBACK_DAYS: 10,
+  BACKFILL_START: '2026-07-09', // fallback only, used if no date-named tabs are found
+
+  TAB: {
+    BOXID_COL: 4,                // Col D
+    FSN_COL: 6,                  // Col F
+    LOCATION_COL: 26,            // Col Z
+    TIME_COL: 27,                // Col AA
+    AB_COL: 28,                  // Col AB (sourced from source col U)
+    AC_COL: 29,                  // Col AC ('P&S' if R won, 'PBD' if I won)
+    PICKER_COL: 33,              // Col AG
+    NAME_COL: 34,                // Col AH (NEW: picker name from PICKER DATA)
+    START_ROW: 2
+  },
+
+  // Fixed-position source columns (0-based indices into the parsed row
+  // array). These are NOT header-detected like fsn/box/bin/time.
+  SOURCE: {
+    PICKER_I_COL: 8,   // Column I
+    PICKER_R_COL: 17,  // Column R -- takes priority over I when both present
+    U_COL: 20          // Column U -- new value written to tab column AB
+  },
+
+  // PICKER DATA tab lives in this same spreadsheet (fed via IMPORTRANGE).
+  // Col A = numeric associate ID, Col B = first name.
+  PICKER_SHEET: {
+    NAME: 'PICKER DATA',
+    ID_COL: 1,     // Col A: AssociateFullList (numeric ID)
+    NAME_COL: 2,   // Col B: FIRST NAME
+    START_ROW: 2
+  },
+
+  LOG_SHEET_NAME: 'Automation_Log'
+};
+
+const MONTHS = {
+  jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3,
+  apr: 4, april: 4, may: 5, jun: 6, june: 6, jul: 7, july: 7,
+  aug: 8, august: 8, sep: 9, sept: 9, september: 9,
+  oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12
+};
+
+// ---------- Sheet Access Helper ----------
+
+function getMasterSpreadsheet() {
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (active && active.getId() === CONFIG.MASTER_SHEET_ID) {
+    return active;
+  }
+  return SpreadsheetApp.openById(CONFIG.MASTER_SHEET_ID);
+}
+
+// ---------- Menu & UI ----------
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Location Mapper')
+    .addItem('Run Backfill (Auto-detected start -> Today)', 'runBackfill')
+    .addItem('Run Daily Update Now', 'runDaily')
+    .addSeparator()
+    .addItem('Run Picker ID Backfill', 'runPickerBackfill')
+    .addItem('Run Picker ID Daily Update Now', 'runPickerDaily')
+    .addSeparator()
+    .addItem('Install Daily Trigger (10 AM)', 'setupDailyTrigger')
+    .addItem('Install Picker ID Daily Trigger (10 AM)', 'setupPickerDailyTrigger')
+    .addToUi();
+}
+
+// ---------- Auto-detect backfill start date ----------
+// Scans all tabs in this spreadsheet, parses date-named ones (e.g. "9th July"),
+// and returns the earliest date found. Falls back to CONFIG.BACKFILL_START
+// if no date-named tabs exist yet (e.g. brand-new duplicate sheet).
+
+function getEarliestTabStart(ss) {
+  const dates = ss.getSheets()
+    .map(sheet => parseTabDate(sheet.getName()))
+    .filter(d => d);
+
+  if (dates.length === 0) {
+    Logger.log('No date-named tabs found -- falling back to CONFIG.BACKFILL_START (' + CONFIG.BACKFILL_START + ').');
+    return new Date(CONFIG.BACKFILL_START);
+  }
+
+  const earliest = new Date(Math.min.apply(null, dates));
+  Logger.log('Auto-detected earliest date-named tab: ' + earliest.toDateString());
+  return earliest;
+}
+
+// ---------- Combined (Location + Time + Picker ID + AB + AC + AH) ----------
+
+function runBackfill() {
+  const ss = getMasterSpreadsheet();
+  const start = getEarliestTabStart(ss);
+  const end = new Date();
+  const tabs = getTabsInRange(ss, start, end);
+
+  executeMapping(ss, tabs, 'BACKFILL');
+}
+
+function runDaily() {
+  const ss = getMasterSpreadsheet();
+  // Tab-selection window (unchanged): only refresh day-tabs from the last
+  // LOOKBACK_DAYS days. This does NOT affect which source files get scanned.
+  const start = new Date();
+  start.setDate(start.getDate() - CONFIG.LOOKBACK_DAYS);
+  const end = new Date();
+  const tabs = getTabsInRange(ss, start, end);
+
+  executeMapping(ss, tabs, 'DAILY');
+}
+
+function setupDailyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'runDaily') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('runDaily').timeBased().atHour(10).everyDays(1).create();
+  notify_('Daily trigger installed: runs every day around 10 AM.');
+}
+
+// ---------- Standalone Picker ID (independent, same tab/date-range logic) ----------
+
+function runPickerBackfill() {
+  const ss = getMasterSpreadsheet();
+  const start = getEarliestTabStart(ss);
+  const end = new Date();
+  const tabs = getTabsInRange(ss, start, end);
+
+  executePickerMapping(ss, tabs, 'PICKER_BACKFILL');
+}
+
+function runPickerDaily() {
+  const ss = getMasterSpreadsheet();
+  const start = new Date();
+  start.setDate(start.getDate() - CONFIG.LOOKBACK_DAYS);
+  const end = new Date();
+  const tabs = getTabsInRange(ss, start, end);
+
+  executePickerMapping(ss, tabs, 'PICKER_DAILY');
+}
+
+function setupPickerDailyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'runPickerDaily') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('runPickerDaily').timeBased().atHour(10).everyDays(1).create();
+  notify_('Picker ID daily trigger installed: runs every day around 10 AM.');
+}
+
+// ---------- Dynamic Header & Key Match Engine ----------
+
+function makeKey(boxId, fsn) {
+  if (!boxId || !fsn) return null;
+  return String(boxId).trim().toUpperCase() + '||' + String(fsn).trim().toUpperCase();
+}
+
+function detectHeaders(headerLine) {
+  const cols = headerLine.split(',').map(c => c.replace(/^["']|["']$/g, '').trim().toLowerCase());
+
+  let fsnCol = -1, boxCol = -1, sortedBoxCol = -1, binCol = -1, timeCol = -1;
+
+  // Pass 1: Strict Exact / High-Priority Matches
+  cols.forEach((col, idx) => {
+    if (col === 'prod_fsn' || col === 'fsn') fsnCol = idx;
+    if (col === 'sorted_box') sortedBoxCol = idx;
+    if (col === 'box_id' || col === 'box' || col === 'box_code') boxCol = idx;
+    if (col === 'bin_id' || col === 'bin' || col === 'location') binCol = idx;
+
+    // Time Column Exact Match
+    if (col === 'item_picked_time' || col === 'picked_time' || col === 'pick_time' || col === 'picked_at') {
+      timeCol = idx;
+    }
+  });
+
+  // Pass 2: Fallback Matches (if exact match not found)
+  cols.forEach((col, idx) => {
+    if (fsnCol === -1 && col.includes('fsn')) fsnCol = idx;
+    if (sortedBoxCol === -1 && col.includes('sorted_box')) sortedBoxCol = idx;
+    if (boxCol === -1 && !col.includes('sorted') && (col.includes('box') || col.includes('tote'))) {
+      boxCol = idx;
+    }
+    if (binCol === -1 && (col.includes('bin') || col.includes('location'))) {
+      binCol = idx;
+    }
+
+    // Fuzzy Time Match (Explicitly exclude box/bin/id columns to prevent misidentification)
+    if (timeCol === -1) {
+      if ((col.includes('time') || col.includes('timestamp') || col.includes('date')) &&
+          !col.includes('box') && !col.includes('bin') && !col.includes('id') && !col.includes('user')) {
+        timeCol = idx;
+      }
+    }
+  });
+
+  if (boxCol === -1 && sortedBoxCol !== -1) boxCol = sortedBoxCol;
+
+  return { fsnCol, boxCol, sortedBoxCol, binCol, timeCol };
+}
+
+// ---------- Shared: build target keys from destination tabs ----------
+
+function buildSheetData(sheets) {
+  const targetKeysMap = {};
+  const sheetDataMap = [];
+
+  sheets.forEach(sheet => {
+    const lastRow = sheet.getLastRow();
+    if (lastRow < CONFIG.TAB.START_ROW) return;
+    const numRows = lastRow - CONFIG.TAB.START_ROW + 1;
+
+    const boxIds = sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.BOXID_COL, numRows, 1).getValues();
+    const fsns = sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.FSN_COL, numRows, 1).getValues();
+    const existingLoc = sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.LOCATION_COL, numRows, 1).getValues();
+    const existingTime = sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.TIME_COL, numRows, 1).getValues();
+    const existingAB = sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.AB_COL, numRows, 1).getValues();
+    const existingAC = sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.AC_COL, numRows, 1).getValues();
+    const existingName = sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.NAME_COL, numRows, 1).getValues();
+    const existingPicker = sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.PICKER_COL, numRows, 1).getValues();
+
+    const keys = [];
+    for (let i = 0; i < numRows; i++) {
+      const key = makeKey(boxIds[i][0], fsns[i][0]);
+      keys.push(key);
+      if (key) targetKeysMap[key] = true;
+    }
+
+    sheetDataMap.push({
+      sheet: sheet,
+      numRows: numRows,
+      keys: keys,
+      existingLoc: existingLoc,
+      existingTime: existingTime,
+      existingAB: existingAB,
+      existingAC: existingAC,
+      existingName: existingName,
+      existingPicker: existingPicker
+    });
+  });
+
+  Logger.log('Needed-keys list built: ' + Object.keys(targetKeysMap).length + ' distinct box+fsn combos.');
+  return { targetKeysMap: targetKeysMap, sheetDataMap: sheetDataMap };
+}
+
+// ---------- Shared: build Picker ID -> Name lookup from PICKER DATA tab ----------
+
+function normalizeId(val) {
+  if (val === undefined || val === null) return '';
+  return String(val).replace(/[^0-9]/g, '');
+}
+
+function buildPickerNameLookup(ss) {
+  const sheet = ss.getSheetByName(CONFIG.PICKER_SHEET.NAME);
+  if (!sheet) {
+    Logger.log('"' + CONFIG.PICKER_SHEET.NAME + '" sheet not found -- picker names will be left blank.');
+    return {};
+  }
+  const lastRow = sheet.getLastRow();
+  if (lastRow < CONFIG.PICKER_SHEET.START_ROW) return {};
+  const numRows = lastRow - CONFIG.PICKER_SHEET.START_ROW + 1;
+
+  const ids = sheet.getRange(CONFIG.PICKER_SHEET.START_ROW, CONFIG.PICKER_SHEET.ID_COL, numRows, 1).getValues();
+  const names = sheet.getRange(CONFIG.PICKER_SHEET.START_ROW, CONFIG.PICKER_SHEET.NAME_COL, numRows, 1).getValues();
+
+  const lookup = {};
+  for (let i = 0; i < numRows; i++) {
+    const normId = normalizeId(ids[i][0]);
+    const name = cleanVal(names[i][0]);
+    if (normId && name && !lookup[normId]) lookup[normId] = name;
+  }
+  Logger.log('Picker name lookup built: ' + Object.keys(lookup).length + ' IDs from "' + CONFIG.PICKER_SHEET.NAME + '".');
+  return lookup;
+}
+
+// ---------- Shared: discover & scan drive files ----------
+// No date filter: every file in the folder is a candidate on every run.
+// Speed is handled by early-exit once every needed key has a primary match.
+
+function scanSourceFiles(targetKeysMap) {
+  const folder = DriveApp.getFolderById(CONFIG.DRIVE_FOLDER_ID);
+  const files = [];
+  collectCandidateFiles(folder, files);
+  files.sort((a, b) => a.getLastUpdated() - b.getLastUpdated());
+
+  const primaryLookup = {};
+  const fallbackLookup = {};
+  const stats = {
+    touched: 0, skipped: 0, rowsScanned: 0, primaryMatches: 0, fallbackMatches: 0,
+    totalKeys: Object.keys(targetKeysMap).length,
+    resolvedCount: 0
+  };
+
+  for (let f = 0; f < files.length; f++) {
+    if (stats.resolvedCount >= stats.totalKeys && stats.totalKeys > 0) {
+      Logger.log('All ' + stats.totalKeys + ' needed keys resolved via primary match — skipping remaining ' + (files.length - f) + ' file(s).');
+      break;
+    }
+    const file = files[f];
+    Logger.log('Processing file: "' + file.getName() + '" (size: ' + file.getSize() + ' bytes)');
+    try {
+      if (file.getMimeType() === MimeType.GOOGLE_SHEETS) {
+        parseGoogleSheet(file, targetKeysMap, primaryLookup, fallbackLookup, stats);
+      } else {
+        streamCsvInChunks(file, targetKeysMap, primaryLookup, fallbackLookup, stats);
+      }
+      stats.touched++;
+    } catch (e) {
+      stats.skipped++;
+      Logger.log('Error processing ' + file.getName() + ': ' + e.message);
+    }
+  }
+
+  Logger.log('Pass summary: ' + stats.touched + ' file(s) touched, ' + stats.rowsScanned + ' rows scanned, ' + stats.resolvedCount + '/' + stats.totalKeys + ' keys resolved.');
+  return { primaryLookup: primaryLookup, fallbackLookup: fallbackLookup, stats: stats };
+}
+
+// ---------- Shared: write results back to destination tabs ----------
+// write = { location: bool, time: bool, picker: bool, ab: bool }
+// AC (P&S/PBD source tag) and AH (picker name) are written whenever `picker` is written.
+
+function applyResults(sheetDataMap, primaryLookup, fallbackLookup, pickerNameLookup, write) {
+  const runLogStats = [];
+
+  sheetDataMap.forEach(item => {
+    const outLoc = [];
+    const outTime = [];
+    const outAB = [];
+    const outAC = [];
+    const outName = [];
+    const outPicker = [];
+    let primaryMatched = 0;
+    let fallbackMatched = 0;
+
+    for (let i = 0; i < item.numRows; i++) {
+      const key = item.keys[i];
+      let hit = key ? primaryLookup[key] : null;
+      if (hit) {
+        primaryMatched++;
+      } else if (key && fallbackLookup[key]) {
+        hit = fallbackLookup[key];
+        fallbackMatched++;
+      }
+
+      if (write.location) outLoc.push([hit ? hit.location : item.existingLoc[i][0]]);
+      if (write.time) outTime.push([hit ? hit.time : item.existingTime[i][0]]);
+      if (write.ab) outAB.push([(hit && hit.uValue) ? hit.uValue : item.existingAB[i][0]]);
+      if (write.picker) {
+        outPicker.push([(hit && hit.pickerId) ? hit.pickerId : item.existingPicker[i][0]]);
+        outAC.push([(hit && hit.pickerSource) ? hit.pickerSource : item.existingAC[i][0]]);
+
+        let pickerName = '';
+        if (hit && hit.pickerId) {
+          pickerName = pickerNameLookup[normalizeId(hit.pickerId)] || '';
+        }
+        outName.push([pickerName || item.existingName[i][0]]);
+      }
+    }
+
+    if (write.location) {
+      item.sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.LOCATION_COL, item.numRows, 1).setValues(outLoc);
+    }
+    if (write.time) {
+      item.sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.TIME_COL, item.numRows, 1).setValues(outTime);
+    }
+    if (write.ab) {
+      item.sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.AB_COL, item.numRows, 1).setValues(outAB);
+    }
+    if (write.picker) {
+      item.sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.PICKER_COL, item.numRows, 1).setValues(outPicker);
+      item.sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.AC_COL, item.numRows, 1).setValues(outAC);
+      item.sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.NAME_COL, item.numRows, 1).setValues(outName);
+    }
+
+    const totalMatched = primaryMatched + fallbackMatched;
+    const unmatched = item.numRows - totalMatched;
+    runLogStats.push({ tab: item.sheet.getName(), rows: item.numRows, matched: totalMatched, fallbackMatched: fallbackMatched, unmatched: unmatched });
+
+    Logger.log(item.sheet.getName() + ' : ' + totalMatched + ' matched (' + fallbackMatched + ' via sorted_box fallback), ' + unmatched + ' unmatched (of ' + item.numRows + ')');
+  });
+
+  return runLogStats;
+}
+
+// ---------- Execution Engines ----------
+
+// Combined: Location + Item Picked Time + Picker ID + AB + AC + AH, single file scan
+function executeMapping(ss, sheets, mode) {
+  const built = buildSheetData(sheets);
+  const scanned = scanSourceFiles(built.targetKeysMap);
+  const pickerNameLookup = buildPickerNameLookup(ss);
+  const runLogStats = applyResults(built.sheetDataMap, scanned.primaryLookup, scanned.fallbackLookup, pickerNameLookup,
+    { location: true, time: true, picker: true, ab: true });
+
+  logRun(ss, mode, runLogStats, scanned.stats);
+  notify_(mode + ' complete. Scanned ' + scanned.stats.rowsScanned + ' rows across ' + scanned.stats.touched + ' files in sheet: ' + ss.getName());
+}
+
+// Standalone: Picker ID + AC + AH ONLY (Z/AA/AB untouched)
+function executePickerMapping(ss, sheets, mode) {
+  const built = buildSheetData(sheets);
+  const scanned = scanSourceFiles(built.targetKeysMap);
+  const pickerNameLookup = buildPickerNameLookup(ss);
+  const runLogStats = applyResults(built.sheetDataMap, scanned.primaryLookup, scanned.fallbackLookup, pickerNameLookup,
+    { location: false, time: false, picker: true, ab: false });
+
+  logRun(ss, mode, runLogStats, scanned.stats);
+  notify_(mode + ' complete (Picker ID only). Scanned ' + scanned.stats.rowsScanned + ' rows across ' + scanned.stats.touched + ' files in sheet: ' + ss.getName());
+}
+
+// ---------- Stream Reader ----------
+
+function streamCsvInChunks(file, targetKeysMap, primaryLookup, fallbackLookup, stats) {
+  const token = ScriptApp.getOAuthToken();
+  const chunkSize = 15 * 1024 * 1024;
+  let start = 0;
+  let buffer = '';
+  let headers = null;
+
+  while (true) {
+    const end = start + chunkSize - 1;
+    const resp = UrlFetchApp.fetch(
+      'https://www.googleapis.com/drive/v3/files/' + file.getId() + '?alt=media',
+      {
+        headers: { Authorization: 'Bearer ' + token, Range: 'bytes=' + start + '-' + end },
+        muteHttpExceptions: true
+      }
+    );
+
+    const code = resp.getResponseCode();
+    if (code !== 206 && code !== 200) break;
+
+    const chunkText = resp.getBlob().getDataAsString();
+    if (!chunkText) break;
+
+    buffer += chunkText;
+    start += chunkText.length;
+
+    const lastNewLine = buffer.lastIndexOf('\n');
+    if (lastNewLine === -1) {
+      if (code === 200 || chunkText.length < chunkSize) break;
+      continue;
+    }
+
+    const lines = buffer.substring(0, lastNewLine).split(/\r?\n/);
+    buffer = buffer.substring(lastNewLine + 1);
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+
+      if (!headers) {
+        headers = detectHeaders(line);
+        Logger.log('"' + file.getName() + '" header matched OK: box=col' + (headers.boxCol + 1) +
+                   ', fsn=col' + (headers.fsnCol + 1) + ', bin=col' + (headers.binCol + 1) +
+                   ', time=col' + (headers.timeCol + 1) + ', sorted_box=col' + (headers.sortedBoxCol + 1) +
+                   ' | picker(fixed): I=col' + (CONFIG.SOURCE.PICKER_I_COL + 1) + ', R=col' + (CONFIG.SOURCE.PICKER_R_COL + 1) +
+                   ' | AB-source(fixed): U=col' + (CONFIG.SOURCE.U_COL + 1));
+        continue;
+      }
+
+      stats.rowsScanned++;
+      parseAndIndexRow(line.split(','), headers, targetKeysMap, primaryLookup, fallbackLookup, stats);
+
+      if (stats.resolvedCount >= stats.totalKeys && stats.totalKeys > 0) {
+        Logger.log('"' + file.getName() + '" — all keys resolved mid-file, stopping further reads for this file.');
+        return; // no point fetching further chunks or scanning the tail buffer
+      }
+    }
+
+    if (code === 200 || chunkText.length < chunkSize) break;
+  }
+
+  if (buffer.trim() && headers) {
+    stats.rowsScanned++;
+    parseAndIndexRow(buffer.split(','), headers, targetKeysMap, primaryLookup, fallbackLookup, stats);
+  }
+}
+
+function parseGoogleSheet(file, targetKeysMap, primaryLookup, fallbackLookup, stats) {
+  const sheet = SpreadsheetApp.openById(file.getId()).getSheets()[0];
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return;
+
+  const headerLine = data[0].join(',');
+  const headers = detectHeaders(headerLine);
+
+  for (let r = 1; r < data.length; r++) {
+    stats.rowsScanned++;
+    parseAndIndexRow(data[r], headers, targetKeysMap, primaryLookup, fallbackLookup, stats);
+    if (stats.resolvedCount >= stats.totalKeys && stats.totalKeys > 0) break;
+  }
+}
+
+function parseAndIndexRow(cols, h, targetKeysMap, primaryLookup, fallbackLookup, stats) {
+  const maxCol = Math.max(h.fsnCol, h.boxCol, h.sortedBoxCol, h.binCol, h.timeCol);
+  if (cols.length <= maxCol) return;
+
+  const fsn = cleanVal(cols[h.fsnCol]);
+  if (!fsn) return;
+
+  const bin = cleanVal(cols[h.binCol]);
+  const time = cleanVal(cols[h.timeCol]);
+  const pickerInfo = extractPickerId(cols);
+  const pickerId = pickerInfo.value;
+  const pickerSource = pickerInfo.source === 'R' ? 'P&S' : 'PBD';
+  const uValue = extractUValue(cols);
+
+  if (h.boxCol !== -1) {
+    const boxId = cleanVal(cols[h.boxCol]);
+    if (boxId) {
+      const pKey = makeKey(boxId, fsn);
+      if (targetKeysMap[pKey] && !primaryLookup[pKey]) {
+        primaryLookup[pKey] = { location: bin, time: time, pickerId: pickerId, pickerSource: pickerSource, uValue: uValue };
+        stats.primaryMatches++;
+        stats.resolvedCount++;
+      }
+    }
+  }
+
+  if (h.sortedBoxCol !== -1) {
+    const sortedBoxId = cleanVal(cols[h.sortedBoxCol]);
+    if (sortedBoxId) {
+      const fKey = makeKey(sortedBoxId, fsn);
+      if (targetKeysMap[fKey] && !primaryLookup[fKey] && !fallbackLookup[fKey]) {
+        fallbackLookup[fKey] = { location: bin, time: time, pickerId: pickerId, pickerSource: pickerSource, uValue: uValue };
+        stats.fallbackMatches++;
+      }
+    }
+  }
+}
+
+// Picker ID: fixed-position columns I and R. R wins if present, else I.
+// Returns which source won so callers can tag it (P&S vs PBD downstream).
+function extractPickerId(cols) {
+  const rVal = cols.length > CONFIG.SOURCE.PICKER_R_COL ? cleanVal(cols[CONFIG.SOURCE.PICKER_R_COL]) : '';
+  if (rVal) return { value: rVal, source: 'R' };
+  const iVal = cols.length > CONFIG.SOURCE.PICKER_I_COL ? cleanVal(cols[CONFIG.SOURCE.PICKER_I_COL]) : '';
+  return { value: iVal, source: 'I' };
+}
+
+// Fixed-position column U -> written to tab column AB.
+function extractUValue(cols) {
+  return cols.length > CONFIG.SOURCE.U_COL ? cleanVal(cols[CONFIG.SOURCE.U_COL]) : '';
+}
+
+function cleanVal(val) {
+  if (val === undefined || val === null) return '';
+  return String(val).replace(/^["']|["']$/g, '').trim();
+}
+
+function collectCandidateFiles(folder, out) {
+  // No date filter: box IDs can legitimately reference older source files,
+  // so every matching file in the folder is a candidate. Speed is handled
+  // by early-exit once every needed key is resolved (see scanSourceFiles).
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    const name = f.getName().toLowerCase();
+    const looksRelevant = name.endsWith('.csv') || name.endsWith('.xlsx') ||
+      f.getMimeType() === MimeType.CSV ||
+      f.getMimeType() === MimeType.GOOGLE_SHEETS ||
+      f.getMimeType() === MimeType.MICROSOFT_EXCEL;
+    if (!looksRelevant) continue;
+    out.push(f);
+  }
+  const subIt = folder.getFolders();
+  while (subIt.hasNext()) {
+    collectCandidateFiles(subIt.next(), out);
+  }
+}
+
+// ---------- Tab Helpers & Logging ----------
+
+function parseTabDate(tabName) {
+  const m = tabName.match(/^(\d{1,2})(?:st|nd|rd|th)?[\s_-]+([A-Za-z]+)/i);
+  if (!m) return null;
+  const day = parseInt(m[1], 10);
+  const month = MONTHS[m[2].toLowerCase()];
+  if (!month) return null;
+
+  const now = new Date();
+  let year = now.getFullYear();
+  if (month - (now.getMonth() + 1) > 6) year -= 1;
+
+  const d = new Date(year, month - 1, day);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function getTabsInRange(ss, start, end) {
+  const s = new Date(start); s.setHours(0, 0, 0, 0);
+  const e = new Date(end); e.setHours(23, 59, 59, 999);
+  return ss.getSheets().filter(sheet => {
+    const d = parseTabDate(sheet.getName());
+    return d && d >= s && d <= e;
+  });
+}
+
+function logRun(ss, mode, tabStats, globalStats) {
+  let log = ss.getSheetByName(CONFIG.LOG_SHEET_NAME);
+  if (!log) {
+    log = ss.insertSheet(CONFIG.LOG_SHEET_NAME);
+    log.appendRow(['Timestamp', 'Mode', 'Tab', 'Rows Scanned', 'Rows Matched', 'Fallback Matched', 'Files Touched', 'Scanned File Rows']);
+  }
+  const ts = new Date();
+  tabStats.forEach(s => {
+    log.appendRow([ts, mode, s.tab, s.rows, s.matched, s.fallbackMatched, globalStats.touched, globalStats.rowsScanned]);
+  });
+}
+
+function notify_(msg) {
+  try { SpreadsheetApp.getUi().alert(msg); } catch (e) { Logger.log(msg); }
+}
