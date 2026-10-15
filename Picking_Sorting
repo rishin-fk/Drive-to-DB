@@ -1,0 +1,727 @@
+/**
+ * LOCATION / TIME / PICKER / SORTING MAPPER
+ * ------------------------------------------------------------------
+ * - Bound to master sheet: 19H011e8xKfAc4DrRa_vLwoM__XsT0eMaYzn5pEfi7Xo
+ * - Destination tabs are day-wise (e.g. "14th Aug" = MTD, "15th Aug", ...).
+ * - Tab key: Box ID = col D, FSN = col F (unchanged from prior version).
+ *
+ * - PICKING source files (CSV / Google Sheet) in DRIVE_FOLDER_ID are read by
+ *   FIXED column position (row 1 = header, skipped; no header-name detection):
+ *     H = Box ID        D = FSN         N = Sorted Box (fallback key)
+ *     M = Picking Location   J = Picking Time   I = Picker
+ *     Q = Sorted Station     P = Sorting BIN    O = Sorting Time   R = Sorter
+ *   Primary match: source(H,D) -> tab(D,F)
+ *   Fallback match (only for rows primary didn't hit): source(N,D) -> tab(D,F)
+ *   This source always supplies Y/Z/AA (Picking Location/Time/Picker), and
+ *   also acts as the FALLBACK supplier for AB/AC/AE (not AD) when the SORTING
+ *   source folder below has no match for a row.
+ *
+ * - SORTING source files in SORTING_DRIVE_FOLDER_ID are read by FIXED column
+ *   position (row 1 = header, skipped):
+ *     A = Box ID   I = FSN
+ *     AB = Sorted Station   Q = Sorting BIN   G = Sorting Time   U = Sorter
+ *   Primary match only: source(A,I) -> tab(D,F). No fallback key for this
+ *   source. This is the PRIMARY supplier for AB/AC/AD/AE.
+ *
+ * - Writes: Y=Picking Location, Z=Picking Time, AA=Picker,
+ *           AB=Sorted Station, AC=Sorting BIN, AD=Sorting Time, AE=Sorter
+ *   Resolution order per row:
+ *     Y/Z/AA        <- PICKING source only
+ *     AB, AC, AE    <- SORTING source if matched, else PICKING source fallback
+ *     AD            <- SORTING source only; if unmatched, retain existing value
+ *                      (no fallback to PICKING source's Sorting Time)
+ * - Unmatched tab rows keep their existing Y:AE values untouched.
+ * ------------------------------------------------------------------
+ */
+
+const CONFIG = {
+  MASTER_SHEET_ID: '19H011e8xKfAc4DrRa_vLwoM__XsT0eMaYzn5pEfi7Xo',
+  DRIVE_FOLDER_ID: '1ZODejxkhlRJk9OqyzgXRzezGAHLC57ZI',
+  SORTING_DRIVE_FOLDER_ID: '13ClZXG-VvOC6gJfvAV1HKNmaZjGjMIRt',
+  BACKFILL_START: '2026-08-14',
+
+  TAB: {
+    BOXID_COL: 4,   // D
+    FSN_COL: 6,     // F
+    START_ROW: 2,
+    // Destination write range: Y through AE (7 contiguous columns)
+    WRITE_START_COL: 25, // Y
+    WRITE_NUM_COLS: 7    // Y, Z, AA, AB, AC, AD, AE
+  },
+
+  // Fixed-position PICKING source columns (0-based indices into the parsed row array)
+  SOURCE: {
+    BOX_COL: 7,           // H
+    FSN_COL: 3,           // D
+    SORTED_BOX_COL: 13,   // N
+    PICKING_LOCATION_COL: 12, // M
+    PICKING_TIME_COL: 9,      // J
+    PICKER_COL: 8,            // I
+    SORTED_STATION_COL: 16,   // Q
+    SORTING_BIN_COL: 15,      // P
+    SORTING_TIME_COL: 14,     // O
+    SORTER_COL: 17            // R
+  },
+
+  // Fixed-position SORTING source columns (0-based indices into the parsed row array)
+  SORTING_SOURCE: {
+    BOX_COL: 0,           // A
+    FSN_COL: 8,           // I
+    SORTED_STATION_COL: 27, // AB
+    SORTING_BIN_COL: 16,    // Q
+    SORTING_TIME_COL: 6,    // G
+    SORTER_COL: 20          // U
+  },
+
+  LOG_SHEET_NAME: 'Automation_Log'
+};
+
+// Compute fixed source widths once, outside the per-row parsing loops.
+const PICKING_WIDTH_ = Math.max(...Object.keys(CONFIG.SOURCE).map(k => CONFIG.SOURCE[k])) + 1;
+const SORTING_WIDTH_ = Math.max(...Object.keys(CONFIG.SORTING_SOURCE).map(k => CONFIG.SORTING_SOURCE[k])) + 1;
+
+const MONTHS = {
+  jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3,
+  apr: 4, april: 4, may: 5, jun: 6, june: 6, jul: 7, july: 7,
+  aug: 8, august: 8, sep: 9, sept: 9, september: 9,
+  oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12
+};
+
+// ---------- Sheet Access Helper ----------
+
+function getMasterSpreadsheet() {
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (active && active.getId() === CONFIG.MASTER_SHEET_ID) {
+    return active;
+  }
+  return SpreadsheetApp.openById(CONFIG.MASTER_SHEET_ID);
+}
+
+// ---------- Menu & UI ----------
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('CCTV TOOLS')
+    .addItem('▶ RUN AUTOMATION (Daily > Fetch > Generate)', 'runDailySequence')
+    .addSeparator()
+    .addItem('Run Backfill (14th Aug -> Today)', 'runBackfill')
+    .addItem('Run Daily Update Now', 'runDaily')
+    .addSeparator()
+    .addItem('Fetch NVR & Camera Data', 'fetchNVRDataForActiveSheet')
+    .addSeparator()
+    .addItem('Preview selected image', 'previewSelectedImage')
+    .addSeparator()
+    .addSeparator()
+    .addItem('Export A:H to NB','exportActiveTabAToH')
+    .addSeparator()
+    .addSeparator()
+    .addItem('Generate for active sheet', 'generateForActiveSheet')
+    .addItem('Generate for all date sheets', 'generateForAllDateSheets')
+    .addSeparator()
+    .addSeparator()
+    .addItem('Fetch CCTV Link','fetchCctvLinks')
+    .addToUi();
+
+}
+
+// ---------- Entry Points ----------
+
+function runBackfill() {
+  const ss = getMasterSpreadsheet();
+  const start = new Date(CONFIG.BACKFILL_START);
+  const end = new Date();
+  const tabs = getTabsInRange(ss, start, end);
+
+  executeMapping(ss, tabs, 'BACKFILL');
+}
+
+function runDaily() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss || ss.getId() !== CONFIG.MASTER_SHEET_ID) {
+    throw new Error('Open the master spreadsheet and select a dated sheet first.');
+  }
+  const sheet = ss.getActiveSheet();
+  if (!sheet || !parseTabDate(sheet.getName())) {
+    throw new Error('Select a dated sheet, such as "8th Sep", before running this action.');
+  }
+  executeMapping(ss, [sheet], 'DAILY');
+}
+
+
+
+// ---------- Key Match Engine ----------
+
+function makeKey(boxId, fsn) {
+  if (!boxId || !fsn) return null;
+  return String(boxId).trim().toUpperCase() + '||' + String(fsn).trim().toUpperCase();
+}
+
+// ---------- Build target keys + read existing destination values from tabs ----------
+
+function buildSheetData(sheets) {
+  const targetKeysMap = {};
+  const sheetDataMap = [];
+
+  sheets.forEach(sheet => {
+    const lastRow = sheet.getLastRow();
+    if (lastRow < CONFIG.TAB.START_ROW) return;
+    const numRows = lastRow - CONFIG.TAB.START_ROW + 1;
+
+    const keyStart = Math.min(CONFIG.TAB.BOXID_COL, CONFIG.TAB.FSN_COL);
+    const keyEnd = Math.max(CONFIG.TAB.BOXID_COL, CONFIG.TAB.FSN_COL);
+    const keyValues = sheet.getRange(CONFIG.TAB.START_ROW, keyStart, numRows, keyEnd - keyStart + 1).getValues();
+    // Single batched read of existing Y:AE (7 cols) to preserve unmatched rows
+    const existing = sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.WRITE_START_COL, numRows, CONFIG.TAB.WRITE_NUM_COLS).getValues();
+
+    const keys = [];
+    for (let i = 0; i < numRows; i++) {
+      const key = makeKey(keyValues[i][CONFIG.TAB.BOXID_COL - keyStart], keyValues[i][CONFIG.TAB.FSN_COL - keyStart]);
+      keys.push(key);
+      if (key) targetKeysMap[key] = true;
+    }
+
+    sheetDataMap.push({ sheet: sheet, numRows: numRows, keys: keys, existing: existing });
+  });
+
+  Logger.log('Needed-keys list built: ' + Object.keys(targetKeysMap).length + ' distinct box+fsn combos.');
+  return { targetKeysMap: targetKeysMap, sheetDataMap: sheetDataMap };
+}
+
+// ---------- Discover & scan drive files (PICKING source) ----------
+
+function scanSourceFiles(targetKeysMap) {
+  prepareBoxFilter_(targetKeysMap);
+  const folder = DriveApp.getFolderById(CONFIG.DRIVE_FOLDER_ID);
+  const files = [];
+  collectCandidateFiles(folder, files);
+  const orderedFiles = files.map((file, index) => ({ file: file, updated: file.getLastUpdated().getTime(), index: index }));
+  // Newest updated file first; first exact match wins within this order.
+  orderedFiles.sort((a, b) => b.updated - a.updated || a.index - b.index);
+  orderedFiles.forEach((item, index) => { files[index] = item.file; });
+
+  const primaryLookup = {};
+  const fallbackLookup = {};
+  const stats = {
+    touched: 0, skipped: 0, rowsScanned: 0, primaryMatches: 0, fallbackMatches: 0,
+    // Early-exit bookkeeping: once every needed key has a primary hit, no file
+    // scanned after that point can improve the result, so we stop reading.
+    totalKeys: Object.keys(targetKeysMap).length,
+    resolvedCount: 0
+  };
+
+  for (let f = 0; f < files.length; f++) {
+    if (stats.resolvedCount >= stats.totalKeys && stats.totalKeys > 0) {
+      Logger.log('All ' + stats.totalKeys + ' needed keys resolved via primary match — skipping remaining ' + (files.length - f) + ' file(s).');
+      break;
+    }
+    const file = files[f];
+    Logger.log('Processing file: "' + file.getName() + '" (size: ' + file.getSize() + ' bytes)');
+    try {
+      if (file.getMimeType() === MimeType.GOOGLE_SHEETS) {
+        parseGoogleSheet(file, targetKeysMap, primaryLookup, fallbackLookup, stats);
+      } else {
+        streamCsvInChunks(file, targetKeysMap, primaryLookup, fallbackLookup, stats);
+      }
+      stats.touched++;
+    } catch (e) {
+      stats.skipped++;
+      Logger.log('Error processing ' + file.getName() + ': ' + e.message);
+    }
+  }
+
+  Logger.log('Pass summary: ' + stats.touched + ' file(s) touched, ' + stats.rowsScanned + ' rows scanned, ' + stats.resolvedCount + '/' + stats.totalKeys + ' keys resolved.');
+  return { primaryLookup: primaryLookup, fallbackLookup: fallbackLookup, stats: stats };
+}
+
+// ---------- Discover & scan drive files (SORTING source) ----------
+
+function scanSortingSourceFiles(targetKeysMap) {
+  prepareBoxFilter_(targetKeysMap);
+  const folder = DriveApp.getFolderById(CONFIG.SORTING_DRIVE_FOLDER_ID);
+  const files = [];
+  collectCandidateFiles(folder, files);
+  const orderedFiles = files.map((file, index) => ({ file: file, updated: file.getLastUpdated().getTime(), index: index }));
+  // Newest updated file first; first exact match wins within this order.
+  orderedFiles.sort((a, b) => b.updated - a.updated || a.index - b.index);
+  orderedFiles.forEach((item, index) => { files[index] = item.file; });
+
+  const primaryLookup = {};
+  const stats = {
+    touched: 0, skipped: 0, rowsScanned: 0, primaryMatches: 0,
+    totalKeys: Object.keys(targetKeysMap).length,
+    resolvedCount: 0
+  };
+
+  for (let f = 0; f < files.length; f++) {
+    if (stats.resolvedCount >= stats.totalKeys && stats.totalKeys > 0) {
+      Logger.log('SORTING: all ' + stats.totalKeys + ' needed keys resolved — skipping remaining ' + (files.length - f) + ' file(s).');
+      break;
+    }
+    const file = files[f];
+    Logger.log('SORTING: processing file: "' + file.getName() + '" (size: ' + file.getSize() + ' bytes)');
+    try {
+      if (file.getMimeType() === MimeType.GOOGLE_SHEETS) {
+        parseSortingGoogleSheet(file, targetKeysMap, primaryLookup, stats);
+      } else {
+        streamSortingCsvInChunks(file, targetKeysMap, primaryLookup, stats);
+      }
+      stats.touched++;
+    } catch (e) {
+      stats.skipped++;
+      Logger.log('SORTING: error processing ' + file.getName() + ': ' + e.message);
+    }
+  }
+
+  Logger.log('SORTING pass summary: ' + stats.touched + ' file(s) touched, ' + stats.rowsScanned + ' rows scanned, ' + stats.resolvedCount + '/' + stats.totalKeys + ' keys resolved.');
+  return { primaryLookup: primaryLookup, stats: stats };
+}
+
+// ---------- Write results back to destination tabs ----------
+
+function applyResults(sheetDataMap, primaryLookup, fallbackLookup, sortingPrimaryLookup) {
+  const runLogStats = [];
+
+  sheetDataMap.forEach(item => {
+    const outRows = [];
+    let primaryMatched = 0;
+    let fallbackMatched = 0;
+    let sortingMatched = 0;
+    let noHitRows = 0;
+
+    for (let i = 0; i < item.numRows; i++) {
+      const key = item.keys[i];
+
+      let pickHit = key ? primaryLookup[key] : null;
+      if (pickHit) {
+        primaryMatched++;
+      } else if (key && fallbackLookup[key]) {
+        pickHit = fallbackLookup[key];
+        fallbackMatched++;
+      }
+
+      const sortHit = key ? sortingPrimaryLookup[key] : null;
+      if (sortHit) sortingMatched++;
+
+      const existingRow = item.existing[i];
+
+      if (!pickHit && !sortHit) {
+        noHitRows++;
+        outRows.push(existingRow); // preserve untouched
+        continue;
+      }
+
+      const pickingLocation = pickHit ? pickHit.pickingLocation : existingRow[0];
+      const pickingTime = pickHit ? pickHit.pickingTime : existingRow[1];
+      const picker = pickHit ? pickHit.picker : existingRow[2];
+
+      // AB/AC/AE: SORTING source wins, PICKING source is fallback.
+      // AD: SORTING source only — never falls back to PICKING source.
+      const sortedStation = sortHit ? sortHit.sortedStation : (pickHit ? pickHit.sortedStation : existingRow[3]);
+      const sortingBin = sortHit ? sortHit.sortingBin : (pickHit ? pickHit.sortingBin : existingRow[4]);
+      const sortingTime = sortHit ? sortHit.sortingTime : existingRow[5];
+      const sorter = sortHit ? sortHit.sorter : (pickHit ? pickHit.sorter : existingRow[6]);
+
+      outRows.push([pickingLocation, pickingTime, picker, sortedStation, sortingBin, sortingTime, sorter]);
+    }
+
+    item.sheet.getRange(CONFIG.TAB.START_ROW, CONFIG.TAB.WRITE_START_COL, item.numRows, CONFIG.TAB.WRITE_NUM_COLS).setValues(outRows);
+
+    const totalMatched = primaryMatched + fallbackMatched;
+    const unmatched = noHitRows;
+    runLogStats.push({ tab: item.sheet.getName(), rows: item.numRows, matched: totalMatched, fallbackMatched: fallbackMatched, sortingMatched: sortingMatched, unmatched: unmatched });
+
+    Logger.log(item.sheet.getName() + ' : ' + totalMatched + ' picking-matched (' + fallbackMatched + ' via sorted_box fallback), ' + sortingMatched + ' sorting-matched, ' + unmatched + ' fully unmatched (of ' + item.numRows + ')');
+  });
+
+  return runLogStats;
+}
+
+// ---------- Execution Engine ----------
+
+function executeMapping(ss, sheets, mode) {
+  const started = Date.now();
+  const built = buildSheetData(sheets);
+  const keyCount = Object.keys(built.targetKeysMap).length;
+  Logger.log(mode + ': selected sheets: ' + sheets.map(s => s.getName()).join(', ') +
+    '; target keys: ' + keyCount + '; build ms: ' + (Date.now() - started));
+  if (!keyCount) {
+    notify_('No valid Box ID + FSN keys in the selected sheets. No source files scanned.');
+    return;
+  }
+  let stage = Date.now();
+  const scanned = scanSourceFiles(built.targetKeysMap);
+  Logger.log('Picking scan ms: ' + (Date.now() - stage));
+  stage = Date.now();
+  const sortingScanned = scanSortingSourceFiles(built.targetKeysMap);
+  Logger.log('Sorting scan ms: ' + (Date.now() - stage));
+  stage = Date.now();
+  const runLogStats = applyResults(built.sheetDataMap, scanned.primaryLookup, scanned.fallbackLookup, sortingScanned.primaryLookup);
+  logRun(ss, mode, runLogStats, scanned.stats, sortingScanned.stats);
+  Logger.log('Write/log ms: ' + (Date.now() - stage) + '; total ms: ' + (Date.now() - started));
+  notify_(mode + ' complete. Scanned ' + scanned.stats.rowsScanned + ' picking rows + ' + sortingScanned.stats.rowsScanned + ' sorting rows across ' + (scanned.stats.touched + sortingScanned.stats.touched) + ' files in sheet: ' + ss.getName());
+}
+
+// ---------- Stream Reader (fixed-column PICKING source, header row skipped) ----------
+
+function streamCsvInChunks(file, targetKeysMap, primaryLookup, fallbackLookup, stats) {
+  streamMappedCsv_(file, stats, cols => parseAndIndexRow(cols, targetKeysMap, primaryLookup, fallbackLookup, stats));
+}
+
+function parseGoogleSheet(file, targetKeysMap, primaryLookup, fallbackLookup, stats) {
+  const sheet = SpreadsheetApp.openById(file.getId()).getSheets()[0];
+  const rowCount = sheet.getLastRow();
+  if (rowCount < 2 || sheet.getLastColumn() < PICKING_WIDTH_) return;
+  const data = sheet.getRange(1, 1, rowCount, PICKING_WIDTH_).getValues();
+  if (data.length < 2) return;
+
+  for (let r = 1; r < data.length; r++) { // r=0 is header, skipped
+    stats.rowsScanned++;
+    parseAndIndexRow(data[r], targetKeysMap, primaryLookup, fallbackLookup, stats);
+    if (stats.resolvedCount >= stats.totalKeys && stats.totalKeys > 0) break;
+  }
+}
+
+function parseAndIndexRow(cols, targetKeysMap, primaryLookup, fallbackLookup, stats) {
+  const S = CONFIG.SOURCE;
+  if (cols.length < PICKING_WIDTH_) return;
+
+  const boxId = cleanVal(cols[S.BOX_COL]);
+  const sortedBoxId = cleanVal(cols[S.SORTED_BOX_COL]);
+  const boxes = prepareBoxFilter_(targetKeysMap);
+  if (!boxes.has(boxId.toUpperCase()) && !boxes.has(sortedBoxId.toUpperCase())) return;
+  const fsn = cleanVal(cols[S.FSN_COL]);
+  if (!fsn) return;
+  const pKey = makeKey(boxId, fsn);
+  const fKey = makeKey(sortedBoxId, fsn);
+  const needsPrimary = pKey && targetKeysMap[pKey] && !primaryLookup[pKey];
+  const needsFallback = fKey && targetKeysMap[fKey] && !primaryLookup[fKey] && !fallbackLookup[fKey];
+  if (!needsPrimary && !needsFallback) return;
+
+  const record = {
+    pickingLocation: cleanVal(cols[S.PICKING_LOCATION_COL]),
+    pickingTime: cleanVal(cols[S.PICKING_TIME_COL]),
+    picker: cleanVal(cols[S.PICKER_COL]),
+    sortedStation: cleanVal(cols[S.SORTED_STATION_COL]),
+    sortingBin: cleanVal(cols[S.SORTING_BIN_COL]),
+    sortingTime: cleanVal(cols[S.SORTING_TIME_COL]),
+    sorter: cleanVal(cols[S.SORTER_COL])
+  };
+
+  if (boxId) {
+    if (targetKeysMap[pKey] && !primaryLookup[pKey]) {
+      primaryLookup[pKey] = record;
+      stats.primaryMatches++;
+      stats.resolvedCount++;
+    }
+  }
+
+  if (sortedBoxId) {
+    if (targetKeysMap[fKey] && !primaryLookup[fKey] && !fallbackLookup[fKey]) {
+      fallbackLookup[fKey] = record;
+      stats.fallbackMatches++;
+    }
+  }
+}
+
+// ---------- Stream Reader (fixed-column SORTING source, header row skipped) ----------
+
+function streamSortingCsvInChunks(file, targetKeysMap, primaryLookup, stats) {
+  streamMappedCsv_(file, stats, cols => parseAndIndexSortingRow(cols, targetKeysMap, primaryLookup, stats));
+}
+
+function parseSortingGoogleSheet(file, targetKeysMap, primaryLookup, stats) {
+  const sheet = SpreadsheetApp.openById(file.getId()).getSheets()[0];
+  const rowCount = sheet.getLastRow();
+  if (rowCount < 2 || sheet.getLastColumn() < SORTING_WIDTH_) return;
+  const data = sheet.getRange(1, 1, rowCount, SORTING_WIDTH_).getValues();
+  if (data.length < 2) return;
+
+  for (let r = 1; r < data.length; r++) { // r=0 is header, skipped
+    stats.rowsScanned++;
+    parseAndIndexSortingRow(data[r], targetKeysMap, primaryLookup, stats);
+    if (stats.resolvedCount >= stats.totalKeys && stats.totalKeys > 0) break;
+  }
+}
+
+function parseAndIndexSortingRow(cols, targetKeysMap, primaryLookup, stats) {
+  const S = CONFIG.SORTING_SOURCE;
+  if (cols.length < SORTING_WIDTH_) return;
+
+  const boxId = cleanVal(cols[S.BOX_COL]);
+  if (!boxId || !prepareBoxFilter_(targetKeysMap).has(boxId.toUpperCase())) return;
+  const fsn = cleanVal(cols[S.FSN_COL]);
+  if (!fsn) return;
+
+  const key = makeKey(boxId, fsn);
+  if (!targetKeysMap[key] || primaryLookup[key]) return;
+
+  primaryLookup[key] = {
+    sortedStation: cleanVal(cols[S.SORTED_STATION_COL]),
+    sortingBin: cleanVal(cols[S.SORTING_BIN_COL]),
+    sortingTime: cleanVal(cols[S.SORTING_TIME_COL]),
+    sorter: cleanVal(cols[S.SORTER_COL])
+  };
+  stats.primaryMatches++;
+  stats.resolvedCount++;
+}
+
+function cleanVal(val) {
+  if (val === undefined || val === null) return '';
+  return String(val).replace(/^["']|["']$/g, '').trim();
+}
+
+// In-memory only, rebuilt for each new target map. Exact FSN matching still follows.
+const boxFilters_ = new WeakMap();
+function prepareBoxFilter_(keys) {
+  let boxes = boxFilters_.get(keys);
+  if (!boxes) {
+    boxes = new Set(Object.keys(keys).map(key => key.slice(0, key.lastIndexOf('||'))));
+    boxFilters_.set(keys, boxes);
+  }
+  return boxes;
+}
+
+function collectCandidateFiles(folder, out) {
+  // No date filter: box IDs can legitimately reference older source files,
+  // so every matching file in the folder is a candidate. Speed is handled
+  // by early-exit once every needed key is resolved (see scanSourceFiles).
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    const name = f.getName().toLowerCase();
+    const looksRelevant = name.endsWith('.csv') || name.endsWith('.xlsx') ||
+      f.getMimeType() === MimeType.CSV ||
+      f.getMimeType() === MimeType.GOOGLE_SHEETS ||
+      f.getMimeType() === MimeType.MICROSOFT_EXCEL;
+    if (!looksRelevant) continue;
+    out.push(f);
+  }
+  const subIt = folder.getFolders();
+  while (subIt.hasNext()) {
+    collectCandidateFiles(subIt.next(), out);
+  }
+}
+
+// ---------- Tab Helpers & Logging ----------
+
+function parseTabDate(tabName) {
+  const m = tabName.match(/^(\d{1,2})(?:st|nd|rd|th)?[\s_-]+([A-Za-z]+)/i);
+  if (!m) return null;
+  const day = parseInt(m[1], 10);
+  const month = MONTHS[m[2].toLowerCase()];
+  if (!month) return null;
+
+  const now = new Date();
+  let year = now.getFullYear();
+  if (month - (now.getMonth() + 1) > 6) year -= 1;
+
+  const d = new Date(year, month - 1, day);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function getTabsInRange(ss, start, end) {
+  const s = new Date(start); s.setHours(0, 0, 0, 0);
+  const e = new Date(end); e.setHours(23, 59, 59, 999);
+  return ss.getSheets().filter(sheet => {
+    const d = parseTabDate(sheet.getName());
+    return d && d >= s && d <= e;
+  });
+}
+
+function logRun(ss, mode, tabStats, globalStats, sortingGlobalStats) {
+  let log = ss.getSheetByName(CONFIG.LOG_SHEET_NAME);
+  if (!log) {
+    log = ss.insertSheet(CONFIG.LOG_SHEET_NAME);
+    log.appendRow(['Timestamp', 'Mode', 'Tab', 'Rows Scanned', 'Rows Matched', 'Fallback Matched', 'Sorting Matched', 'Files Touched', 'Scanned File Rows', 'Sorting Files Touched', 'Sorting File Rows']);
+  }
+  const ts = new Date();
+  const rows = tabStats.map(s => [ts, mode, s.tab, s.rows, s.matched, s.fallbackMatched, s.sortingMatched, globalStats.touched, globalStats.rowsScanned, sortingGlobalStats.touched, sortingGlobalStats.rowsScanned]);
+  if (rows.length) log.getRange(log.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function notify_(msg) {
+  Logger.log(msg);
+
+  const ss=
+  SpreadsheetApp.getActiveSpreadsheet();
+  if(ss){
+    ss.toast(String(msg), 'Status',5);
+  }
+}
+
+
+// Fast text reader: no downloaded byte arrays or per-character field construction.
+// Re-read the incomplete physical line, so a UTF-8 character is never joined after
+// being decoded in two separate requests. Logical multiline records stay buffered.
+function streamMappedCsv_(file, stats, acceptRow) {
+  const token = ScriptApp.getOAuthToken();
+  const chunkSize = 15 * 1024 * 1024;
+  let start = 0, headerSkipped = false, stopped = false;
+  const parser = csvParser_(cols => {
+    if (!headerSkipped) { headerSkipped = true; return true; }
+    stats.rowsScanned++;
+    acceptRow(cols);
+    stopped = stats.totalKeys > 0 && stats.resolvedCount >= stats.totalKeys;
+    return !stopped;
+  });
+  while (!stopped) {
+    const resp = UrlFetchApp.fetch('https://www.googleapis.com/drive/v3/files/' + file.getId() + '?alt=media', {
+      headers: { Authorization: 'Bearer ' + token, Range: 'bytes=' + start + '-' + (start + chunkSize - 1) },
+      muteHttpExceptions: true
+    });
+    const code = resp.getResponseCode();
+    if (code !== 200 && code !== 206) throw new Error('CSV download HTTP ' + code + ' at byte ' + start);
+    if (code === 200 && start !== 0) throw new Error('Server ignored CSV byte range at ' + start);
+    const text = resp.getContentText('UTF-8');
+    let finished = code === 200;
+    if (code === 206) {
+      const headers = resp.getAllHeaders();
+      const key = Object.keys(headers).find(k => k.toLowerCase() === 'content-range');
+      const range = key && String(headers[key]).match(/^bytes (\d+)-(\d+)\/(\d+)$/i);
+      if (!range || Number(range[1]) !== start || Number(range[2]) < start) {
+        throw new Error('Invalid CSV Content-Range at byte ' + start);
+      }
+      finished = Number(range[2]) + 1 >= Number(range[3]);
+    }
+    if (finished) { parser.feed(text); if (!stopped) parser.finish(); break; }
+    const cut = text.lastIndexOf('\n') + 1;
+    if (!cut) throw new Error('CSV physical line exceeds download chunk; cannot advance safely');
+    const complete = text.slice(0, cut);
+    parser.feed(complete);
+    start += utf8Length_(complete);
+  }
+}
+
+function utf8Length_(text) {
+  // Native regex scans; ASCII data needs no per-character JavaScript processing.
+  const two = text.match(/[\u0080-\u07ff]/g);
+  const three = text.match(/[\u0800-\uffff]/g);
+  const pairs = text.match(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g);
+  return text.length + (two ? two.length : 0) +
+    2 * (three ? three.length : 0) - 2 * (pairs ? pairs.length : 0);
+}
+
+function csvParser_(onRow) {
+  let pending = '', record = '', quoted = false, first = true, stopped = false;
+  function consume(line) {
+    if (first) { first = false; line = line.replace(/^\uFEFF/, ''); }
+    record += line;
+    const quotes = line.match(/"/g);
+    if (quotes && quotes.length % 2) quoted = !quoted;
+    if (quoted) return;
+    const value = record.replace(/\r?\n$/, '');
+    record = '';
+    if (!value.trim()) return;
+    let cols;
+    if (value.indexOf('"') < 0) cols = value.split(',');
+    else {
+      // Native regex handles whole fields, including commas/newlines inside quotes.
+      cols = [];
+      const fields = /(?:^|,)("(?:[^"]|"")*"|[^,]*)/g;
+      let match;
+      while ((match = fields.exec(value)) !== null) {
+        const field = match[1];
+        cols.push(field[0] === '"' ? field.slice(1, -1).replace(/""/g, '"') : field);
+        if (match[0].length === 0) fields.lastIndex++;
+      }
+    }
+    stopped = onRow(cols) === false;
+  }
+  return {
+    feed: function(text) {
+      const combined = pending + text;
+      let pos = 0, end;
+      while (!stopped && (end = combined.indexOf('\n', pos)) !== -1) {
+        consume(combined.slice(pos, end + 1));
+        pos = end + 1;
+      }
+      pending = stopped ? '' : combined.slice(pos);
+    },
+    finish: function() {
+      if (stopped) return;
+      if (pending) consume(pending);
+      pending = '';
+      if (quoted) throw new Error('Unterminated quoted CSV field');
+    }
+  };
+}
+
+// ---------- Image Sidebar Handlers ----------
+
+function previewSelectedImage() {
+  const html = HtmlService.createHtmlOutputFromFile('Sidebar')
+    .setTitle('Image Preview');
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+function getSelectedImagePreview() {
+  try {
+    const sheet = SpreadsheetApp.getActiveSheet();
+    const cell = sheet.getActiveCell();
+    const formula = cell.getFormula();
+    const a1Notation = cell.getA1Notation();
+
+    // Extracts URL from =IMAGE("URL") formula
+    const match = formula.match(/=IMAGE\(\s*["']([^"']+)["']/i);
+
+    if (match && match[1]) {
+      return {
+        found: true,
+        cell: a1Notation,
+        url: match[1]
+      };
+    }
+
+    return {
+      found: false,
+      cell: a1Notation,
+      message: 'Select a cell containing an =IMAGE("URL") formula.'
+    };
+  } catch (err) {
+    return {
+      found: false,
+      message: 'Select an active cell in the sheet.'
+    };
+  }
+}
+function columnToLetter_(col) {
+  let letter = '';
+  while (col > 0) {
+    const rem = (col - 1) % 26;
+    letter = String.fromCharCode(65 + rem) + letter;
+    col = Math.floor((col - 1) / 26);
+  }
+  return letter;
+}
+
+function getSelectedRowImages() {
+  try {
+    const sheet = SpreadsheetApp.getActiveSheet();
+    const cell = sheet.getActiveCell();
+    const row = cell.getRow();
+    const lastCol = sheet.getLastColumn();
+    if (lastCol < 1) return { found: false, row: row, message: 'Empty sheet.' };
+
+    const formulas = sheet.getRange(row, 1, 1, lastCol).getFormulas()[0];
+    const images = [];
+
+    for (let c = 0; c < formulas.length; c++) {
+      const match = formulas[c] && formulas[c].match(/=IMAGE\(\s*["']([^"']+)["']/i);
+      if (match && match[1]) {
+        images.push({
+          cell: columnToLetter_(c + 1) + row,
+          url: match[1]
+        });
+      }
+    }
+
+    if (images.length === 0) {
+      return { found: false, row: row, message: 'No =IMAGE("URL") cells found in row ' + row + '.' };
+    }
+
+    return { found: true, row: row, images: images };
+  } catch (err) {
+    return { found: false, message: 'Select an active cell in the sheet.' };
+  }
+}
